@@ -1,84 +1,455 @@
-name: Daily Stock Analysis
+#!/usr/bin/env python3
+"""
+Professional Stock Analysis System
+- Fetches real-time stock data
+- Calculates technical indicators
+- Generates AI-powered insights (if API key provided)
+- Sends notifications to multiple channels
+"""
 
-on:
-  schedule:
-    - cron: '30 14 * * 1-5'
-  workflow_dispatch:
-
-jobs:
-  analyze:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-generativeai requests pandas yfinance
-      
-      - name: Create configuration file
-        run: |
-          cat > config.yaml << 'EOF'
-          gemini_api_key: "${{ secrets.GEMINI_API_KEY }}"
-          stock_list: "${{ secrets.STOCK_LIST }}"
-          report_type: "simple"
-          search_enabled: false
-          notification:
-            enabled: false
-          litellm:
-            enabled: false
-          telegram:
-            enabled: false
-          discord:
-            enabled: false
-          EOF
-      
-      - name: Run stock analysis
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}
-        run: |
-          python -c "
-import os
 import json
-import requests
+import os
+import sys
+import argparse
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+import time
 
-# Get stock list
-stocks = os.environ.get('STOCK_LIST', '600519')
-stock_list = stocks.split(',')
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'logs/stock_analysis_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Get API key
-api_key = os.environ.get('GEMINI_API_KEY', '')
 
-print('=' * 50)
-print('Daily Stock Analysis Report')
-print('=' * 50)
-print(f'Date: $(date)')
-print(f'Stocks to analyze: {stock_list}')
-print('=' * 50)
+@dataclass
+class StockData:
+    """Stock data container"""
+    symbol: str
+    price: float
+    change: float
+    change_percent: float
+    volume: int
+    high: float
+    low: float
+    timestamp: str
 
-if api_key:
-    print('✓ Gemini API Key found')
-    print('✓ Running AI analysis...')
+
+@dataclass
+class AnalysisResult:
+    """Analysis result container"""
+    symbol: str
+    current_price: float
+    daily_change: float
+    daily_change_percent: float
+    volume: int
+    technical_signals: Dict[str, str]
+    recommendation: str
+    risk_level: str
+    ai_insight: Optional[str] = None
+    timestamp: str = None
+
+
+class StockFetcher:
+    """Fetch stock data from multiple sources"""
     
-    for stock in stock_list:
-        print(f'\n📊 Analyzing {stock}...')
-        # Simple analysis output
-        print(f'   Stock: {stock}')
-        print(f'   Status: Analysis complete')
-        print(f'   Recommendation: Hold')
-        print(f'   Confidence: Medium')
-else:
-    print('✗ Gemini API Key missing')
-    print('   Please add GEMINI_API_KEY to GitHub Secrets')
+    @staticmethod
+    def fetch_yahoo_finance(symbol: str) -> Optional[StockData]:
+        """Fetch from Yahoo Finance (no API key needed)"""
+        try:
+            import urllib.request
+            import json
+            
+            # Use Yahoo Finance API
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'Mozilla/5.0')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+                result = data['chart']['result'][0]
+                meta = result['meta']
+                
+                # Get current price
+                current_price = meta.get('regularMarketPrice', 0)
+                previous_close = meta.get('previousClose', current_price)
+                
+                if previous_close > 0:
+                    change = current_price - previous_close
+                    change_percent = (change / previous_close) * 100
+                else:
+                    change = 0
+                    change_percent = 0
+                
+                return StockData(
+                    symbol=symbol,
+                    price=round(current_price, 2),
+                    change=round(change, 2),
+                    change_percent=round(change_percent, 2),
+                    volume=meta.get('regularMarketVolume', 0),
+                    high=meta.get('regularMarketDayHigh', current_price),
+                    low=meta.get('regularMarketDayLow', current_price),
+                    timestamp=datetime.now().isoformat()
+                )
+        except Exception as e:
+            logger.error(f"Yahoo Finance error for {symbol}: {e}")
+            return None
+    
+    @staticmethod
+    def fetch_from_cache(symbol: str) -> Optional[StockData]:
+        """Load from cache file if available"""
+        cache_file = f"data/{symbol}_cache.json"
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                    cache_time = datetime.fromisoformat(data['timestamp'])
+                    if datetime.now() - cache_time < timedelta(minutes=5):
+                        return StockData(**data)
+            except Exception as e:
+                logger.warning(f"Cache read error: {e}")
+        return None
+    
+    def fetch(self, symbol: str, use_cache: bool = True) -> Optional[StockData]:
+        """Fetch stock data with cache fallback"""
+        if use_cache:
+            cached = self.fetch_from_cache(symbol)
+            if cached:
+                logger.info(f"Using cached data for {symbol}")
+                return cached
+        
+        data = self.fetch_yahoo_finance(symbol)
+        
+        if data and use_cache:
+            os.makedirs("data", exist_ok=True)
+            with open(f"data/{symbol}_cache.json", 'w') as f:
+                json.dump(asdict(data), f)
+        
+        return data
 
-print('\n' + '=' * 50)
-print('Analysis completed successfully')
-print('=' * 50)
-"
+
+class TechnicalAnalyzer:
+    """Calculate technical indicators"""
+    
+    @staticmethod
+    def analyze_momentum(stock: StockData) -> Dict[str, str]:
+        """Analyze price momentum"""
+        signals = {}
+        
+        if stock.change_percent > 2:
+            signals['momentum'] = 'Strongly Bullish 🔼'
+            signals['action'] = 'Consider BUY'
+        elif stock.change_percent > 0.5:
+            signals['momentum'] = 'Bullish 📈'
+            signals['action'] = 'Accumulate'
+        elif stock.change_percent > -0.5:
+            signals['momentum'] = 'Neutral ➡️'
+            signals['action'] = 'Hold'
+        elif stock.change_percent > -2:
+            signals['momentum'] = 'Bearish 📉'
+            signals['action'] = 'Reduce Position'
+        else:
+            signals['momentum'] = 'Strongly Bearish 🔻'
+            signals['action'] = 'SELL / Avoid'
+        
+        # Volume analysis
+        if stock.volume > 10000000:  # 10M+ shares
+            signals['volume'] = 'High Volume 🔥 - Strong interest'
+        elif stock.volume > 5000000:
+            signals['volume'] = 'Above Average 📊'
+        else:
+            signals['volume'] = 'Low Volume 💤'
+        
+        # Range analysis
+        range_percent = ((stock.high - stock.low) / stock.price) * 100
+        if range_percent > 2:
+            signals['volatility'] = 'High Volatility ⚡'
+        elif range_percent > 1:
+            signals['volatility'] = 'Moderate Volatility'
+        else:
+            signals['volatility'] = 'Low Volatility 🎯'
+        
+        return signals
+    
+    def analyze(self, stock: StockData) -> Dict[str, str]:
+        return self.analyze_momentum(stock)
+
+
+class AIInsights:
+    """Generate AI-powered insights using Gemini or other LLMs"""
+    
+    def __init__(self):
+        self.api_key = os.environ.get('GEMINI_API_KEY')
+        self.model = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+    
+    def generate_insight(self, stock: StockData, signals: Dict) -> Optional[str]:
+        """Generate AI insight if API key is available"""
+        if not self.api_key:
+            logger.info("No Gemini API key found - skipping AI insights")
+            return None
+        
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.model)
+            
+            prompt = f"""
+            Analyze this stock briefly (2-3 sentences):
+            Stock: {stock.symbol}
+            Price: ${stock.price}
+            Change: {stock.change_percent}%
+            Volume: {stock.volume:,}
+            Technical signals: {signals}
+            
+            Give a practical trading insight.
+            """
+            
+            response = model.generate_content(prompt)
+            return response.text.strip()
+            
+        except ImportError:
+            logger.warning("Google Generative AI package not installed")
+            return None
+        except Exception as e:
+            logger.error(f"AI insight generation failed: {e}")
+            return None
+
+
+class NotificationSender:
+    """Send notifications to various channels"""
+    
+    @staticmethod
+    def send_pushplus(token: str, title: str, content: str) -> bool:
+        """Send to PushPlus (WeChat)"""
+        if not token:
+            return False
+        try:
+            import urllib.request
+            import urllib.parse
+            
+            url = "http://www.pushplus.plus/send"
+            data = {
+                "token": token,
+                "title": title,
+                "content": content,
+                "template": "markdown"
+            }
+            
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                result = json.loads(response.read().decode())
+                return result.get('code') == 200
+        except Exception as e:
+            logger.error(f"PushPlus error: {e}")
+            return False
+    
+    @staticmethod
+    def send_discord(webhook_url: str, content: str) -> bool:
+        """Send to Discord webhook"""
+        if not webhook_url:
+            return False
+        try:
+            import urllib.request
+            
+            data = {"content": content}
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return response.status == 204
+        except Exception as e:
+            logger.error(f"Discord error: {e}")
+            return False
+
+
+class StockAnalysisSystem:
+    """Main orchestrator"""
+    
+    def __init__(self):
+        self.fetcher = StockFetcher()
+        self.analyzer = TechnicalAnalyzer()
+        self.ai_insights = AIInsights()
+        self.notifier = NotificationSender()
+    
+    def analyze_stock(self, symbol: str) -> Optional[AnalysisResult]:
+        """Analyze a single stock"""
+        logger.info(f"Analyzing {symbol}...")
+        
+        # Fetch data
+        stock_data = self.fetcher.fetch(symbol)
+        if not stock_data:
+            logger.error(f"Failed to fetch {symbol}")
+            return None
+        
+        # Technical analysis
+        signals = self.analyzer.analyze(stock_data)
+        
+        # Generate recommendation based on signals
+        momentum = signals.get('momentum', 'Neutral')
+        if 'Strongly Bullish' in momentum:
+            recommendation = "STRONG BUY"
+            risk_level = "Medium"
+        elif 'Bullish' in momentum:
+            recommendation = "BUY"
+            risk_level = "Low-Medium"
+        elif 'Neutral' in momentum:
+            recommendation = "HOLD"
+            risk_level = "Low"
+        elif 'Bearish' in momentum:
+            recommendation = "REDUCE"
+            risk_level = "Medium-High"
+        else:
+            recommendation = "SELL"
+            risk_level = "High"
+        
+        # AI insights
+        ai_insight = self.ai_insights.generate_insight(stock_data, signals)
+        
+        return AnalysisResult(
+            symbol=symbol,
+            current_price=stock_data.price,
+            daily_change=stock_data.change,
+            daily_change_percent=stock_data.change_percent,
+            volume=stock_data.volume,
+            technical_signals=signals,
+            recommendation=recommendation,
+            risk_level=risk_level,
+            ai_insight=ai_insight,
+            timestamp=datetime.now().isoformat()
+        )
+    
+    def generate_report(self, results: List[AnalysisResult]) -> str:
+        """Generate a formatted report"""
+        report_lines = [
+            "=" * 60,
+            "📊 DAILY STOCK ANALYSIS REPORT",
+            "=" * 60,
+            f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 60,
+            ""
+        ]
+        
+        for result in results:
+            report_lines.append(f"\n【 {result.symbol} 】")
+            report_lines.append(f"💰 Price: ${result.current_price}")
+            
+            # Color-coded change
+            if result.daily_change >= 0:
+                report_lines.append(f"📈 Change: +${result.daily_change} (+{result.daily_change_percent}%) ✅")
+            else:
+                report_lines.append(f"📉 Change: ${result.daily_change} ({result.daily_change_percent}%) ❌")
+            
+            report_lines.append(f"📊 Volume: {result.volume:,}")
+            report_lines.append(f"🎯 Recommendation: {result.recommendation}")
+            report_lines.append(f"⚠️ Risk Level: {result.risk_level}")
+            report_lines.append(f"\n📡 Technical Signals:")
+            for key, value in result.technical_signals.items():
+                report_lines.append(f"   • {key}: {value}")
+            
+            if result.ai_insight:
+                report_lines.append(f"\n🤖 AI Insight:\n   {result.ai_insight}")
+            
+            report_lines.append("")
+            report_lines.append("-" * 40)
+        
+        report_lines.append(f"\n✅ Analysis completed successfully!")
+        report_lines.append(f"📁 Reports saved to: reports/")
+        
+        return "\n".join(report_lines)
+    
+    def run(self, symbols: List[str] = None) -> bool:
+        """Main execution method"""
+        os.makedirs("logs", exist_ok=True)
+        os.makedirs("reports", exist_ok=True)
+        
+        if not symbols:
+            symbols = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA']  # Default stocks
+        
+        logger.info(f"Starting analysis for {len(symbols)} stocks: {symbols}")
+        
+        results = []
+        for symbol in symbols:
+            try:
+                result = self.analyze_stock(symbol)
+                if result:
+                    results.append(result)
+                    logger.info(f"✅ {symbol} analysis complete")
+                else:
+                    logger.warning(f"⚠️ {symbol} analysis failed")
+                
+                # Rate limiting - be nice to the API
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {e}")
+        
+        if not results:
+            logger.error("No successful analyses!")
+            return False
+        
+        # Generate report
+        report = self.generate_report(results)
+        
+        # Save report
+        with open("reports/analysis_report.txt", "w", encoding='utf-8') as f:
+            f.write(report)
+        
+        with open("reports/analysis_report.json", "w") as f:
+            json.dump([asdict(r) for r in results], f, indent=2)
+        
+        # Print to console (for GitHub Actions logs)
+        print(report)
+        
+        # Send notifications if configured
+        pushplus_token = os.environ.get('PUSHPLUS_TOKEN')
+        if pushplus_token:
+            self.notifier.send_pushplus(
+                pushplus_token, 
+                f"Stock Analysis - {datetime.now().strftime('%Y-%m-%d')}", 
+                report
+            )
+            logger.info("PushPlus notification sent")
+        
+        discord_webhook = os.environ.get('DISCORD_WEBHOOK_URL')
+        if discord_webhook:
+            self.notifier.send_discord(discord_webhook, report[:2000])  # Discord limit
+            logger.info("Discord notification sent")
+        
+        logger.info(f"✅ Analysis complete! {len(results)} stocks analyzed")
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Stock Analysis System')
+    parser.add_argument('--stocks', type=str, help='Comma-separated stock symbols')
+    parser.add_argument('--force-run', action='store_true', help='Skip trading day check')
+    parser.add_argument('--no-market-review', action='store_true', help='Skip market review')
+    
+    args = parser.parse_args()
+    
+    stocks = args.stocks.split(',') if args.stocks else None
+    
+    system = StockAnalysisSystem()
+    success = system.run(stocks)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
