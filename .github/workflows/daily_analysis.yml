@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-
-Professional Stock Analysis System
-- Fetches real-time stock data
+"""
+Professional Stock Analysis System - GitHub Actions Ready
+- Fetches real-time stock data using yfinance
 - Calculates technical indicators
-- Generates AI-powered insights (if API key provided)
+- Generates AI-powered insights (optional, requires Gemini API key)
 - Sends notifications to multiple channels
+- Saves reports as artifacts
 """
 
 import json
@@ -16,6 +17,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 import time
+
+# Create directories BEFORE logging
+os.makedirs("logs", exist_ok=True)
+os.makedirs("reports", exist_ok=True)
+os.makedirs("data", exist_ok=True)
 
 # Setup logging
 logging.basicConfig(
@@ -55,56 +61,77 @@ class AnalysisResult:
     risk_level: str
     ai_insight: Optional[str] = None
     timestamp: str = None
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now().isoformat()
 
 
 class StockFetcher:
-    """Fetch stock data from multiple sources"""
+    """Fetch stock data using yfinance"""
     
     @staticmethod
-    def fetch_yahoo_finance(symbol: str) -> Optional[StockData]:
-        """Fetch from Yahoo Finance (no API key needed)"""
+    def fetch_yfinance(symbol: str) -> Optional[StockData]:
+        """Fetch from Yahoo Finance via yfinance library"""
         try:
-            import urllib.request
-            import json
+            import yfinance as yf
             
-            # Use Yahoo Finance API
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'Mozilla/5.0')
+            ticker = yf.Ticker(symbol)
             
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-                result = data['chart']['result'][0]
-                meta = result['meta']
-                
-                # Get current price
-                current_price = meta.get('regularMarketPrice', 0)
-                previous_close = meta.get('previousClose', current_price)
-                
-                if previous_close > 0:
-                    change = current_price - previous_close
-                    change_percent = (change / previous_close) * 100
-                else:
-                    change = 0
-                    change_percent = 0
-                
-                return StockData(
-                    symbol=symbol,
-                    price=round(current_price, 2),
-                    change=round(change, 2),
-                    change_percent=round(change_percent, 2),
-                    volume=meta.get('regularMarketVolume', 0),
-                    high=meta.get('regularMarketDayHigh', current_price),
-                    low=meta.get('regularMarketDayLow', current_price),
-                    timestamp=datetime.now().isoformat()
-                )
+            # Get current data
+            hist = ticker.history(period='2d')
+            if hist.empty:
+                logger.warning(f"No historical data for {symbol}")
+                return None
+            
+            # Get info
+            info = ticker.info
+            
+            # Get current price (try multiple sources)
+            current_price = hist['Close'].iloc[-1]
+            if 'regularMarketPrice' in info and info['regularMarketPrice']:
+                current_price = info['regularMarketPrice']
+            
+            # Get previous close
+            if len(hist) > 1:
+                previous_close = hist['Close'].iloc[-2]
+            else:
+                previous_close = current_price
+            
+            # Calculate changes
+            if previous_close > 0:
+                change = current_price - previous_close
+                change_percent = (change / previous_close) * 100
+            else:
+                change = 0
+                change_percent = 0
+            
+            # Get volume and day range
+            volume = hist['Volume'].iloc[-1] if not hist['Volume'].empty else 0
+            day_high = hist['High'].iloc[-1] if not hist['High'].empty else current_price
+            day_low = hist['Low'].iloc[-1] if not hist['Low'].empty else current_price
+            
+            return StockData(
+                symbol=symbol.upper(),
+                price=round(float(current_price), 2),
+                change=round(float(change), 2),
+                change_percent=round(float(change_percent), 2),
+                volume=int(volume),
+                high=round(float(day_high), 2),
+                low=round(float(day_low), 2),
+                timestamp=datetime.now().isoformat()
+            )
+            
+        except ImportError:
+            logger.error("yfinance not installed. Run: pip install yfinance")
+            return None
         except Exception as e:
-            logger.error(f"Yahoo Finance error for {symbol}: {e}")
+            logger.error(f"yfinance error for {symbol}: {e}")
             return None
     
     @staticmethod
     def fetch_from_cache(symbol: str) -> Optional[StockData]:
-        """Load from cache file if available"""
+        """Load from cache file if available and fresh"""
         cache_file = f"data/{symbol}_cache.json"
         if os.path.exists(cache_file):
             try:
@@ -112,9 +139,10 @@ class StockFetcher:
                     data = json.load(f)
                     cache_time = datetime.fromisoformat(data['timestamp'])
                     if datetime.now() - cache_time < timedelta(minutes=5):
+                        logger.info(f"Using cached data for {symbol}")
                         return StockData(**data)
             except Exception as e:
-                logger.warning(f"Cache read error: {e}")
+                logger.warning(f"Cache read error for {symbol}: {e}")
         return None
     
     def fetch(self, symbol: str, use_cache: bool = True) -> Optional[StockData]:
@@ -122,15 +150,16 @@ class StockFetcher:
         if use_cache:
             cached = self.fetch_from_cache(symbol)
             if cached:
-                logger.info(f"Using cached data for {symbol}")
                 return cached
         
-        data = self.fetch_yahoo_finance(symbol)
+        data = self.fetch_yfinance(symbol)
         
         if data and use_cache:
-            os.makedirs("data", exist_ok=True)
-            with open(f"data/{symbol}_cache.json", 'w') as f:
-                json.dump(asdict(data), f)
+            try:
+                with open(f"data/{symbol}_cache.json", 'w') as f:
+                    json.dump(asdict(data), f)
+            except Exception as e:
+                logger.warning(f"Failed to cache {symbol}: {e}")
         
         return data
 
@@ -140,59 +169,81 @@ class TechnicalAnalyzer:
     
     @staticmethod
     def analyze_momentum(stock: StockData) -> Dict[str, str]:
-        """Analyze price momentum"""
+        """Analyze price momentum and volume"""
         signals = {}
         
-        if stock.change_percent > 2:
+        # Price momentum analysis
+        if stock.change_percent > 3:
             signals['momentum'] = 'Strongly Bullish 🔼'
+            signals['action'] = 'STRONG BUY'
+        elif stock.change_percent > 1.5:
+            signals['momentum'] = 'Bullish 📈'
             signals['action'] = 'Consider BUY'
         elif stock.change_percent > 0.5:
-            signals['momentum'] = 'Bullish 📈'
-            signals['action'] = 'Accumulate'
+            signals['momentum'] = 'Slightly Bullish ↗️'
+            signals['action'] = 'Accumulate on dips'
         elif stock.change_percent > -0.5:
             signals['momentum'] = 'Neutral ➡️'
-            signals['action'] = 'Hold'
+            signals['action'] = 'HOLD'
         elif stock.change_percent > -2:
             signals['momentum'] = 'Bearish 📉'
             signals['action'] = 'Reduce Position'
-        else:
+        elif stock.change_percent > -4:
             signals['momentum'] = 'Strongly Bearish 🔻'
-            signals['action'] = 'SELL / Avoid'
+            signals['action'] = 'Consider SELL'
+        else:
+            signals['momentum'] = 'Crashing ⚠️'
+            signals['action'] = 'IMMEDIATE SELL'
         
         # Volume analysis
-        if stock.volume > 10000000:  # 10M+ shares
-            signals['volume'] = 'High Volume 🔥 - Strong interest'
+        if stock.volume > 50000000:  # 50M+ shares
+            signals['volume'] = 'Extreme Volume 🔥🔥 - High institutional interest'
+        elif stock.volume > 20000000:  # 20M+ shares
+            signals['volume'] = 'Very High Volume 🔥 - Strong interest'
+        elif stock.volume > 10000000:  # 10M+ shares
+            signals['volume'] = 'High Volume 📊 - Above average'
         elif stock.volume > 5000000:
-            signals['volume'] = 'Above Average 📊'
+            signals['volume'] = 'Moderate Volume'
         else:
-            signals['volume'] = 'Low Volume 💤'
+            signals['volume'] = 'Low Volume 💤 - Low liquidity risk'
         
-        # Range analysis
-        range_percent = ((stock.high - stock.low) / stock.price) * 100
-        if range_percent > 2:
-            signals['volatility'] = 'High Volatility ⚡'
-        elif range_percent > 1:
-            signals['volatility'] = 'Moderate Volatility'
+        # Volatility analysis (day range)
+        if stock.high > 0 and stock.low > 0:
+            range_percent = ((stock.high - stock.low) / stock.price) * 100
+            if range_percent > 3:
+                signals['volatility'] = 'Very High Volatility ⚡⚡ - Wide range'
+            elif range_percent > 1.5:
+                signals['volatility'] = 'High Volatility ⚡'
+            elif range_percent > 0.7:
+                signals['volatility'] = 'Moderate Volatility'
+            else:
+                signals['volatility'] = 'Low Volatility 🎯 - Tight range'
         else:
-            signals['volatility'] = 'Low Volatility 🎯'
+            signals['volatility'] = 'Unable to calculate'
         
         return signals
     
     def analyze(self, stock: StockData) -> Dict[str, str]:
+        """Main analysis method"""
         return self.analyze_momentum(stock)
 
 
 class AIInsights:
-    """Generate AI-powered insights using Gemini or other LLMs"""
+    """Generate AI-powered insights using Gemini"""
     
     def __init__(self):
         self.api_key = os.environ.get('GEMINI_API_KEY')
         self.model = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+        self.enabled = bool(self.api_key)
+        
+        if self.enabled:
+            logger.info("AI Insights enabled with Gemini API")
+        else:
+            logger.info("AI Insights disabled (no GEMINI_API_KEY found)")
     
     def generate_insight(self, stock: StockData, signals: Dict) -> Optional[str]:
         """Generate AI insight if API key is available"""
-        if not self.api_key:
-            logger.info("No Gemini API key found - skipping AI insights")
+        if not self.enabled:
             return None
         
         try:
@@ -200,25 +251,32 @@ class AIInsights:
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel(self.model)
             
-            prompt = f"""
-            Analyze this stock briefly (2-3 sentences):
-            Stock: {stock.symbol}
-            Price: ${stock.price}
-            Change: {stock.change_percent}%
-            Volume: {stock.volume:,}
-            Technical signals: {signals}
-            
-            Give a practical trading insight.
-            """
+            prompt = f"""Analyze this stock briefly (2-3 sentences max). Be practical and actionable:
+
+Stock: {stock.symbol}
+Current Price: ${stock.price}
+Daily Change: {stock.change_percent:+.2f}%
+Volume: {stock.volume:,}
+Day Range: ${stock.low} - ${stock.high}
+Technical Signal: {signals.get('momentum', 'Unknown')}
+Suggested Action: {signals.get('action', 'Hold')}
+
+Provide a concise trading insight focusing on key levels or strategy."""
             
             response = model.generate_content(prompt)
-            return response.text.strip()
+            insight = response.text.strip()
+            
+            # Limit length for readability
+            if len(insight) > 500:
+                insight = insight[:497] + "..."
+            
+            return insight
             
         except ImportError:
-            logger.warning("Google Generative AI package not installed")
+            logger.warning("Google Generative AI package not installed. Run: pip install google-generativeai")
             return None
         except Exception as e:
-            logger.error(f"AI insight generation failed: {e}")
+            logger.error(f"AI insight generation failed for {stock.symbol}: {e}")
             return None
 
 
@@ -235,6 +293,11 @@ class NotificationSender:
             import urllib.parse
             
             url = "http://www.pushplus.plus/send"
+            
+            # Truncate content if too long
+            if len(content) > 5000:
+                content = content[:4997] + "..."
+            
             data = {
                 "token": token,
                 "title": title,
@@ -250,7 +313,13 @@ class NotificationSender:
             
             with urllib.request.urlopen(req, timeout=10) as response:
                 result = json.loads(response.read().decode())
-                return result.get('code') == 200
+                if result.get('code') == 200:
+                    logger.info("PushPlus notification sent successfully")
+                    return True
+                else:
+                    logger.warning(f"PushPlus error: {result.get('msg')}")
+                    return False
+                    
         except Exception as e:
             logger.error(f"PushPlus error: {e}")
             return False
@@ -263,7 +332,11 @@ class NotificationSender:
         try:
             import urllib.request
             
-            data = {"content": content}
+            # Discord has 2000 char limit
+            if len(content) > 1900:
+                content = content[:1897] + "..."
+            
+            data = {"content": f"```\n{content}\n```"}
             req = urllib.request.Request(
                 webhook_url,
                 data=json.dumps(data).encode('utf-8'),
@@ -271,14 +344,18 @@ class NotificationSender:
             )
             
             with urllib.request.urlopen(req, timeout=10) as response:
-                return response.status == 204
+                success = response.status == 204
+                if success:
+                    logger.info("Discord notification sent successfully")
+                return success
+                
         except Exception as e:
             logger.error(f"Discord error: {e}")
             return False
 
 
 class StockAnalysisSystem:
-    """Main orchestrator"""
+    """Main orchestrator for stock analysis"""
     
     def __init__(self):
         self.fetcher = StockFetcher()
@@ -293,32 +370,40 @@ class StockAnalysisSystem:
         # Fetch data
         stock_data = self.fetcher.fetch(symbol)
         if not stock_data:
-            logger.error(f"Failed to fetch {symbol}")
+            logger.error(f"Failed to fetch data for {symbol}")
             return None
         
         # Technical analysis
         signals = self.analyzer.analyze(stock_data)
         
         # Generate recommendation based on signals
-        momentum = signals.get('momentum', 'Neutral')
-        if 'Strongly Bullish' in momentum:
+        action = signals.get('action', 'HOLD')
+        if 'STRONG BUY' in action:
             recommendation = "STRONG BUY"
             risk_level = "Medium"
-        elif 'Bullish' in momentum:
+        elif 'BUY' in action:
             recommendation = "BUY"
             risk_level = "Low-Medium"
-        elif 'Neutral' in momentum:
+        elif 'Accumulate' in action:
+            recommendation = "ACCUMULATE"
+            risk_level = "Low"
+        elif 'HOLD' in action:
             recommendation = "HOLD"
             risk_level = "Low"
-        elif 'Bearish' in momentum:
+        elif 'Reduce' in action:
             recommendation = "REDUCE"
             risk_level = "Medium-High"
-        else:
+        elif 'SELL' in action:
             recommendation = "SELL"
             risk_level = "High"
+        else:
+            recommendation = "HOLD"
+            risk_level = "Medium"
         
-        # AI insights
-        ai_insight = self.ai_insights.generate_insight(stock_data, signals)
+        # AI insights (only if enabled)
+        ai_insight = None
+        if self.ai_insights.enabled:
+            ai_insight = self.ai_insights.generate_insight(stock_data, signals)
         
         return AnalysisResult(
             symbol=symbol,
@@ -329,121 +414,204 @@ class StockAnalysisSystem:
             technical_signals=signals,
             recommendation=recommendation,
             risk_level=risk_level,
-            ai_insight=ai_insight,
-            timestamp=datetime.now().isoformat()
+            ai_insight=ai_insight
         )
     
     def generate_report(self, results: List[AnalysisResult]) -> str:
         """Generate a formatted report"""
         report_lines = [
-            "=" * 60,
-            "📊 DAILY STOCK ANALYSIS REPORT",
-            "=" * 60,
-            f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "=" * 60,
+            "=" * 70,
+            "📊 PROFESSIONAL STOCK ANALYSIS REPORT",
+            "=" * 70,
+            f"📅 Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"📈 Total Stocks Analyzed: {len(results)}",
+            "=" * 70,
             ""
         ]
         
-        for result in results:
-            report_lines.append(f"\n【 {result.symbol} 】")
-            report_lines.append(f"💰 Price: ${result.current_price}")
-            
-            # Color-coded change
+        # Summary statistics
+        buy_signals = sum(1 for r in results if 'BUY' in r.recommendation)
+        sell_signals = sum(1 for r in results if 'SELL' in r.recommendation)
+        hold_signals = sum(1 for r in results if 'HOLD' in r.recommendation)
+        
+        report_lines.extend([
+            "📊 QUICK SUMMARY",
+            "-" * 70,
+            f"   🔴 STRONG BUY/BUY Signals: {buy_signals}",
+            f"   🟡 HOLD Signals: {hold_signals}",
+            f"   🔴 SELL/REDUCE Signals: {sell_signals}",
+            "",
+            "=" * 70,
+            "📈 DETAILED ANALYSIS",
+            "=" * 70,
+            ""
+        ])
+        
+        for idx, result in enumerate(results, 1):
+            # Price change indicator
             if result.daily_change >= 0:
-                report_lines.append(f"📈 Change: +${result.daily_change} (+{result.daily_change_percent}%) ✅")
+                change_icon = "📈 ✅"
+                change_color = "+"
             else:
-                report_lines.append(f"📉 Change: ${result.daily_change} ({result.daily_change_percent}%) ❌")
+                change_icon = "📉 ❌"
+                change_color = ""
             
-            report_lines.append(f"📊 Volume: {result.volume:,}")
-            report_lines.append(f"🎯 Recommendation: {result.recommendation}")
-            report_lines.append(f"⚠️ Risk Level: {result.risk_level}")
-            report_lines.append(f"\n📡 Technical Signals:")
+            report_lines.extend([
+                f"\n【{idx}】 {result.symbol}",
+                "-" * 50,
+                f"💰 Current Price: ${result.current_price}",
+                f"{change_icon} Daily Change: {change_color}${result.daily_change} ({result.daily_change_percent:+.2f}%)",
+                f"📊 Volume: {result.volume:,}",
+                f"📈 Day Range: ${result.low:.2f} - ${result.high:.2f}",
+                f"🎯 Recommendation: {result.recommendation}",
+                f"⚠️ Risk Level: {result.risk_level}",
+                "",
+                "📡 Technical Signals:"
+            ])
+            
             for key, value in result.technical_signals.items():
-                report_lines.append(f"   • {key}: {value}")
+                report_lines.append(f"   • {key.capitalize()}: {value}")
             
             if result.ai_insight:
-                report_lines.append(f"\n🤖 AI Insight:\n   {result.ai_insight}")
+                report_lines.extend([
+                    "",
+                    "🤖 AI-Powered Insight:",
+                    f"   {result.ai_insight}"
+                ])
             
             report_lines.append("")
-            report_lines.append("-" * 40)
         
-        report_lines.append(f"\n✅ Analysis completed successfully!")
-        report_lines.append(f"📁 Reports saved to: reports/")
+        # Footer
+        report_lines.extend([
+            "=" * 70,
+            "✅ ANALYSIS COMPLETED SUCCESSFULLY",
+            "=" * 70,
+            f"📁 Full report saved to: reports/analysis_report.txt",
+            f"📁 JSON data saved to: reports/analysis_report.json",
+            "=" * 70
+        ])
         
         return "\n".join(report_lines)
     
     def run(self, symbols: List[str] = None) -> bool:
         """Main execution method"""
-        os.makedirs("logs", exist_ok=True)
-        os.makedirs("reports", exist_ok=True)
         
+        # Default stocks if none provided
         if not symbols:
-            symbols = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA']  # Default stocks
+            symbols = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'TSLA', 'AMZN', 'META']
+            logger.info(f"No symbols provided, using defaults: {symbols}")
         
-        logger.info(f"Starting analysis for {len(symbols)} stocks: {symbols}")
+        logger.info(f"🚀 Starting analysis for {len(symbols)} stocks: {', '.join(symbols)}")
         
         results = []
+        failed_symbols = []
+        
         for symbol in symbols:
             try:
-                result = self.analyze_stock(symbol)
+                result = self.analyze_stock(symbol.strip().upper())
                 if result:
                     results.append(result)
-                    logger.info(f"✅ {symbol} analysis complete")
+                    logger.info(f"✅ {symbol} analyzed successfully")
                 else:
+                    failed_symbols.append(symbol)
                     logger.warning(f"⚠️ {symbol} analysis failed")
                 
                 # Rate limiting - be nice to the API
-                time.sleep(1)
+                time.sleep(0.5)
                 
             except Exception as e:
+                failed_symbols.append(symbol)
                 logger.error(f"Error analyzing {symbol}: {e}")
         
         if not results:
-            logger.error("No successful analyses!")
+            logger.error("❌ No successful analyses! Check your internet connection or API keys.")
             return False
+        
+        # Log summary
+        logger.info(f"📊 Analysis complete: {len(results)} succeeded, {len(failed_symbols)} failed")
+        if failed_symbols:
+            logger.warning(f"Failed symbols: {', '.join(failed_symbols)}")
         
         # Generate report
         report = self.generate_report(results)
         
-        # Save report
-        with open("reports/analysis_report.txt", "w", encoding='utf-8') as f:
+        # Save text report
+        report_path = "reports/analysis_report.txt"
+        with open(report_path, "w", encoding='utf-8') as f:
             f.write(report)
+        logger.info(f"📄 Text report saved to {report_path}")
         
-        with open("reports/analysis_report.json", "w") as f:
-            json.dump([asdict(r) for r in results], f, indent=2)
+        # Save JSON report
+        json_path = "reports/analysis_report.json"
+        with open(json_path, "w") as f:
+            # Convert results to serializable format
+            serializable_results = []
+            for r in results:
+                result_dict = asdict(r)
+                # Ensure timestamp is string
+                if 'timestamp' in result_dict and result_dict['timestamp']:
+                    result_dict['timestamp'] = str(result_dict['timestamp'])
+                serializable_results.append(result_dict)
+            json.dump(serializable_results, f, indent=2)
+        logger.info(f"📊 JSON report saved to {json_path}")
         
         # Print to console (for GitHub Actions logs)
-        print(report)
+        print("\n" + report)
         
         # Send notifications if configured
         pushplus_token = os.environ.get('PUSHPLUS_TOKEN')
         if pushplus_token:
+            logger.info("Sending PushPlus notification...")
             self.notifier.send_pushplus(
                 pushplus_token, 
-                f"Stock Analysis - {datetime.now().strftime('%Y-%m-%d')}", 
-                report
+                f"📊 Stock Analysis - {datetime.now().strftime('%Y-%m-%d')}", 
+                report[:4000]  # PushPlus limit
             )
-            logger.info("PushPlus notification sent")
         
         discord_webhook = os.environ.get('DISCORD_WEBHOOK_URL')
         if discord_webhook:
-            self.notifier.send_discord(discord_webhook, report[:2000])  # Discord limit
-            logger.info("Discord notification sent")
+            logger.info("Sending Discord notification...")
+            # Send summary only for Discord (2000 char limit)
+            summary = f"Stock Analysis {datetime.now().strftime('%Y-%m-%d')}\n"
+            summary += f"Analyzed: {len(results)} stocks\n"
+            summary += f"BUY signals: {sum(1 for r in results if 'BUY' in r.recommendation)}\n"
+            summary += f"HOLD: {sum(1 for r in results if 'HOLD' in r.recommendation)}\n"
+            summary += f"SELL: {sum(1 for r in results if 'SELL' in r.recommendation)}"
+            self.notifier.send_discord(discord_webhook, summary)
         
-        logger.info(f"✅ Analysis complete! {len(results)} stocks analyzed")
+        logger.info("✅ Analysis completed successfully!")
         return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Stock Analysis System')
-    parser.add_argument('--stocks', type=str, help='Comma-separated stock symbols')
-    parser.add_argument('--force-run', action='store_true', help='Skip trading day check')
-    parser.add_argument('--no-market-review', action='store_true', help='Skip market review')
+    parser = argparse.ArgumentParser(
+        description='Professional Stock Analysis System',
+        epilog='Example: python stock_analysis.py --stocks AAPL,MSFT,NVDA'
+    )
+    parser.add_argument(
+        '--stocks', 
+        type=str, 
+        help='Comma-separated list of stock symbols (e.g., AAPL,MSFT,NVDA)'
+    )
+    parser.add_argument(
+        '--verbose', 
+        action='store_true', 
+        help='Enable verbose logging'
+    )
     
     args = parser.parse_args()
     
-    stocks = args.stocks.split(',') if args.stocks else None
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     
+    # Parse stocks
+    stocks = None
+    if args.stocks:
+        stocks = [s.strip().upper() for s in args.stocks.split(',')]
+        logger.info(f"User provided stocks: {stocks}")
+    
+    # Run analysis
     system = StockAnalysisSystem()
     success = system.run(stocks)
     
